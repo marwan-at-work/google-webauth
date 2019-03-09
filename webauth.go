@@ -134,7 +134,6 @@ func (c Client) Middleware(h http.Handler) http.Handler {
 
 		// add the user claims to the context and call the handlers below
 		r = r.WithContext(context.WithValue(r.Context(), claimsKey, claims))
-		r = r.WithContext(context.WithValue(r.Context(), tokenKey, ck.Value))
 		h.ServeHTTP(w, r)
 	})
 }
@@ -183,23 +182,17 @@ func (c Client) redirect(w http.ResponseWriter, r *http.Request) {
 
 type key int
 
-const (
-	claimsKey key = 1
-	tokenKey  key = 2
-)
+const claimsKey key = 1
 
-// GetUserClaims will return the Google ID claim set and JWS token if they exist in the
+// GetUserClaims will return the Google ID claim set if it exists in the
 // context. This can be used in coordination with the Client.Middleware.
-func GetUserClaims(ctx context.Context) (claims gcp.IdentityClaimSet, idToken string, err error) {
+func GetUserClaims(ctx context.Context) (gcp.IdentityClaimSet, error) {
+	var claims gcp.IdentityClaimSet
 	clms := ctx.Value(claimsKey)
 	if clms == nil {
-		return claims, "", errors.New("claims not found")
+		return claims, errors.New("claims not found")
 	}
-	tk := ctx.Value(tokenKey)
-	if tk == nil {
-		return claims, "", errors.New("token not found")
-	}
-	return clms.(gcp.IdentityClaimSet), tk.(string), nil
+	return clms.(gcp.IdentityClaimSet), nil
 }
 
 func decodeClaims(token string) (gcp.IdentityClaimSet, error) {
