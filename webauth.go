@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -24,7 +25,11 @@ type (
 	// information to the request context. User information and the JWS token can be
 	// retrieved from the context via GetInfo function.
 	Client struct {
-		cfg      Config
+		cfg          Config
+		secureCookie bool
+		cookieDomain string
+		callbackPath string
+
 		verifier *auth.Verifier
 		log      log.Logger
 	}
@@ -33,14 +38,7 @@ type (
 	Config struct {
 		// CookieName will be used for the HTTP cookie name.
 		CookieName string
-		// CookieDomain will be used for the HTTP cookie domain.
-		CookieDomain string
-		// CookieTTL will be used for the HTTP cookie expiration.
-		CookieTTL time.Duration
 
-		// CallbackURI is the URI Client.Middleware will expect Google to be
-		// redirecting to post login.
-		CallbackURI string
 		// LandingURI is the URI Client.Middleware will redirect to after a successful
 		// callback.
 		LandingURI string
@@ -71,9 +69,16 @@ func NewClient(ctx context.Context, cfg Config, lg log.Logger) (Client, error) {
 	if err != nil {
 		return Client{}, errors.Wrap(err, "unable to init key source")
 	}
+	u, err := url.Parse(cfg.AuthConfig.RedirectURL)
+	if err != nil {
+		return Client{}, errors.Wrap(err, "unable to pasrse redirect URL")
+	}
 
 	return Client{
-		cfg: cfg,
+		cfg:          cfg,
+		cookieDomain: strings.Split(u.Host, ":")[0],
+		secureCookie: u.Scheme == "https",
+		callbackPath: u.Path,
 		verifier: auth.NewVerifier(ks, gcp.IdentityClaimsDecoderFunc,
 			gcp.IdentityVerifyFunc(cfg.IDVerifyFunc)),
 		log: lg,
@@ -85,7 +90,7 @@ func NewClient(ctx context.Context, cfg Config, lg log.Logger) (Client, error) {
 func (c Client) ClearCookie(w http.ResponseWriter) {
 	http.SetCookie(w, &http.Cookie{
 		Name:    c.cfg.CookieName,
-		Domain:  c.cfg.CookieDomain,
+		Domain:  c.cookieDomain,
 		Value:   "",
 		MaxAge:  -1,
 		Expires: time.Unix(0, 0),
@@ -97,8 +102,7 @@ func (c Client) ClearCookie(w http.ResponseWriter) {
 // add the user claims to the inbound request context.
 func (c Client) Middleware(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// if its not the callback URI, let the request pass through
-		if r.URL.Path == c.cfg.CallbackURI {
+		if r.URL.Path == c.callbackPath {
 			c.callbackHandler(w, r)
 			return
 		}
@@ -121,7 +125,11 @@ func (c Client) Middleware(h http.Handler) http.Handler {
 		}
 
 		verified, err := c.verifier.Verify(r.Context(), ck.Value)
-		if !verified || err != nil {
+		if err != nil {
+			c.redirect(w, r)
+			return
+		}
+		if !verified {
 			c.redirect(w, r)
 			return
 		}
@@ -146,7 +154,7 @@ func (c Client) callbackHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
-	token, err := c.cfg.AuthConfig.Exchange(ctx, code)
+	token, err := c.cfg.AuthConfig.Exchange(ctx, code, oauth2.ApprovalForce)
 	if err != nil {
 		c.log.Log("error", err, "message", "unable to exchange code")
 		c.redirect(w, r)
@@ -164,11 +172,20 @@ func (c Client) callbackHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// grab claims so we can use the expiration on our cookie
+	claims, err := decodeClaims(id.(string))
+	if err != nil {
+		c.log.Log("error", err, "message", "unable to decode token")
+		c.redirect(w, r)
+		return
+	}
+
 	http.SetCookie(w, &http.Cookie{
 		Name:    c.cfg.CookieName,
+		Secure:  c.secureCookie,
 		Value:   id.(string),
-		Domain:  c.cfg.CookieDomain,
-		Expires: time.Now().Add(c.cfg.CookieTTL),
+		Domain:  c.cookieDomain,
+		Expires: time.Unix(claims.Exp, 0),
 	})
 
 	http.Redirect(w, r, c.cfg.LandingURI, http.StatusTemporaryRedirect)
