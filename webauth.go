@@ -11,11 +11,13 @@ import (
 	"strings"
 	"time"
 
+	kms "cloud.google.com/go/kms/apiv1"
 	"github.com/NYTimes/gizmo/auth"
 	"github.com/NYTimes/gizmo/auth/gcp"
 	"github.com/go-kit/kit/log"
 	"github.com/pkg/errors"
 	"golang.org/x/oauth2"
+	kmsv1 "google.golang.org/genproto/googleapis/cloud/kms/v1"
 )
 
 type (
@@ -30,6 +32,8 @@ type (
 		cookieDomain string
 		callbackPath string
 
+		keyName  string
+		keys     *kms.KeyManagementClient
 		verifier *auth.Verifier
 		log      log.Logger
 	}
@@ -39,9 +43,10 @@ type (
 		// CookieName will be used for the HTTP cookie name.
 		CookieName string
 
-		// LandingURI is the URI Client.Middleware will redirect to after a successful
-		// callback.
-		LandingURI string
+		// KMSKeyName is used by a Google KMS client for encrypting and decrypting state
+		/// tokens within the oauth exchange.
+		KMSKeyName string
+
 		// AuthConfig is used by Client.Middleware and callback to enable the Google
 		// OAuth flow.
 		AuthConfig *oauth2.Config
@@ -73,9 +78,14 @@ func NewClient(ctx context.Context, cfg Config, lg log.Logger) (Client, error) {
 	if err != nil {
 		return Client{}, errors.Wrap(err, "unable to pasrse redirect URL")
 	}
+	keys, err := kms.NewKeyManagementClient(ctx)
+	if err != nil {
+		return Client{}, errors.Wrap(err, "unable to init KMS client")
+	}
 
 	return Client{
 		cfg:          cfg,
+		keys:         keys,
 		cookieDomain: strings.Split(u.Host, ":")[0],
 		secureCookie: u.Scheme == "https",
 		callbackPath: u.Path,
@@ -147,13 +157,21 @@ func (c Client) Middleware(h http.Handler) http.Handler {
 }
 
 func (c Client) callbackHandler(w http.ResponseWriter, r *http.Request) {
-	code := r.URL.Query().Get("code")
+	q := r.URL.Query()
+	code := q.Get("code")
 	if strings.TrimSpace(code) == "" {
 		c.redirect(w, r)
 		return
 	}
-
 	ctx := r.Context()
+
+	// verify state
+	uri, ok := c.verifyState(ctx, q.Get("state"))
+	if !ok {
+		c.redirect(w, r)
+		return
+	}
+
 	token, err := c.cfg.AuthConfig.Exchange(ctx, code, oauth2.ApprovalForce)
 	if err != nil {
 		c.log.Log("error", err, "message", "unable to exchange code")
@@ -182,12 +200,53 @@ func (c Client) callbackHandler(w http.ResponseWriter, r *http.Request) {
 		Expires: time.Unix(claims.Exp, 0),
 	})
 
-	http.Redirect(w, r, c.cfg.LandingURI, http.StatusTemporaryRedirect)
+	http.Redirect(w, r, uri, http.StatusTemporaryRedirect)
+}
+
+func (c Client) verifyState(ctx context.Context, state string) (string, bool) {
+	if state == "" {
+		return "", false
+	}
+	rawState, err := base64.StdEncoding.DecodeString(state)
+	if err != nil {
+		return "", false
+	}
+
+	decRes, err := c.keys.Decrypt(ctx, &kmsv1.DecryptRequest{
+		Name:       c.cfg.KMSKeyName,
+		Ciphertext: rawState,
+	})
+	if err != nil {
+		c.log.Log("error", err, "message", "unable to decrypt state",
+			"state", state)
+		return "", false
+	}
+
+	return string(decRes.Plaintext), true
 }
 
 func (c Client) redirect(w http.ResponseWriter, r *http.Request) {
-	// TODO come up with better state token mgmt
-	http.Redirect(w, r, c.cfg.AuthConfig.AuthCodeURL("state"),
+	state := "/" // can't be empty
+	uri := r.URL.EscapedPath()
+	if r.URL.RawQuery != "" {
+		uri += "?" + r.URL.RawQuery
+	}
+	// avoid redirect loops
+	if strings.HasPrefix(uri, c.cfg.AuthConfig.RedirectURL) {
+		uri = "/"
+	}
+	// encrypt current URL as state
+	encRes, err := c.keys.Encrypt(r.Context(), &kmsv1.EncryptRequest{
+		Name:      c.cfg.KMSKeyName,
+		Plaintext: []byte(uri),
+	})
+	if err != nil {
+		c.log.Log("error", err, "message", "unable to encrypt state")
+	} else {
+		state = base64.StdEncoding.EncodeToString(encRes.Ciphertext)
+	}
+
+	http.Redirect(w, r, c.cfg.AuthConfig.AuthCodeURL(state),
 		http.StatusTemporaryRedirect)
 }
 
