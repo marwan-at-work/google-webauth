@@ -166,12 +166,6 @@ func (c Client) callbackHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	good, err := c.verifier.Verify(ctx, id.(string))
-	if err != nil || !good {
-		c.redirect(w, r)
-		return
-	}
-
 	// grab claims so we can use the expiration on our cookie
 	claims, err := decodeClaims(id.(string))
 	if err != nil {
