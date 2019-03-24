@@ -1,4 +1,4 @@
-// package webauth is an experimental package to add Google OAuth user flow to a web
+// Package webauth is an experimental package to add Google OAuth user flow to a web
 // server.
 package webauth
 
@@ -99,9 +99,9 @@ func New(ctx context.Context, cfg Config) (Authenticator, error) {
 	}, nil
 }
 
-// ClearCookie can be used within a "log out" flow. It will add an HTTP cookie with a -1
+// LogOut can be used to clear an existing session. It will add an HTTP cookie with a -1
 // "MaxAge" to the response to remove the cookie from the logged in user's browser.
-func (c Authenticator) ClearCookie(w http.ResponseWriter) {
+func (c Authenticator) LogOut(w http.ResponseWriter) {
 	http.SetCookie(w, &http.Cookie{
 		Name:    c.cfg.CookieName,
 		Domain:  c.cookieDomain,
