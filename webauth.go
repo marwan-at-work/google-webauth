@@ -157,13 +157,8 @@ func (c Client) Middleware(h http.Handler) http.Handler {
 }
 
 func (c Client) callbackHandler(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
-	code := q.Get("code")
-	if strings.TrimSpace(code) == "" {
-		c.redirect(w, r)
-		return
-	}
 	ctx := r.Context()
+	q := r.URL.Query()
 
 	// verify state
 	uri, ok := c.verifyState(ctx, q.Get("state"))
@@ -172,7 +167,13 @@ func (c Client) callbackHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token, err := c.cfg.AuthConfig.Exchange(ctx, code, oauth2.ApprovalForce)
+	code := q.Get("code")
+	if strings.TrimSpace(code) == "" {
+		c.redirect(w, r)
+		return
+	}
+
+	token, err := c.cfg.AuthConfig.Exchange(ctx, code)
 	if err != nil {
 		c.log.Log("error", err, "message", "unable to exchange code")
 		c.redirect(w, r)
@@ -199,7 +200,6 @@ func (c Client) callbackHandler(w http.ResponseWriter, r *http.Request) {
 		Domain:  c.cookieDomain,
 		Expires: time.Unix(claims.Exp, 0),
 	})
-
 	http.Redirect(w, r, uri, http.StatusTemporaryRedirect)
 }
 
