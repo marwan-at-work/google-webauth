@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
@@ -21,12 +22,14 @@ import (
 )
 
 type (
-	// Client leans on Google's OAuth user flow to capture a Google Identity JWS and use
-	// it in a local, short lived HTTP cookie. The `Middleware` function manages login
-	// redirects, OAuth callbacks, dropping the HTTP cookie and adding the JWS claims
-	// information to the request context. User information and the JWS token can be
-	// retrieved from the context via GetInfo function.
-	Client struct {
+	// Authenticator leans on Google's OAuth user flow to capture a Google Identity JWS
+	// and use it in a local, short lived HTTP cookie. The `Middleware` function manages
+	// login redirects, OAuth callbacks, dropping the HTTP cookie and adding the JWS
+	// claims information to the request context. User information and the JWS token can
+	// be retrieved from the context via GetInfo function.
+	// The user state in the login flow is encrypted using Google KMS. Ensure the service
+	// account being used has permissions to encrypt and decrypt.
+	Authenticator struct {
 		cfg          Config
 		secureCookie bool
 		cookieDomain string
@@ -38,22 +41,22 @@ type (
 		log      log.Logger
 	}
 
-	// Config encapsulates the needs of the Client.
+	// Config encapsulates the needs of the Authenticator.
 	Config struct {
-		// CookieName will be used for the HTTP cookie name.
+		// CookieName will be used for the local HTTP cookie name.
 		CookieName string
 
 		// KMSKeyName is used by a Google KMS client for encrypting and decrypting state
-		/// tokens within the oauth exchange.
+		// tokens within the oauth exchange.
 		KMSKeyName string
 
-		// AuthConfig is used by Client.Middleware and callback to enable the Google
-		// OAuth flow.
+		// AuthConfig is used by Authenticator.Middleware and callback to enable the
+		// Google OAuth flow.
 		AuthConfig *oauth2.Config
 
 		// HeaderExceptions can optionally be included. Any requests that include any of
-		// the headers included will skip all Client.Middlware checks and no claims
-		// information will be added to the context.
+		// the headers included will skip all Authenticator.Middlware checks and no
+		// claims information will be added to the context.
 		// This can be useful for unspoofable headers like Google App Engine's
 		// "X-AppEngine-*" headers for Google Task Queues.
 		HeaderExceptions []string
@@ -63,27 +66,29 @@ type (
 		IDConfig gcp.IdentityConfig
 		// IDVerifyFunc allows developers to add their own verification on the user
 		// claims. For example, one could enable access for anyone with an email domain
-		// of "@google.com".
+		// of "@example.com".
 		IDVerifyFunc func(context.Context, gcp.IdentityClaimSet) bool
+
+		// Logger will be used to log any errors encountered during the auth flow.
+		Logger log.Logger
 	}
 )
 
-// NewClient will instantiate a new Client.
-func NewClient(ctx context.Context, cfg Config, lg log.Logger) (Client, error) {
+// New will instantiate a new Authenticator.
+func New(ctx context.Context, cfg Config) (Authenticator, error) {
 	ks, err := gcp.NewIdentityPublicKeySource(ctx, cfg.IDConfig)
 	if err != nil {
-		return Client{}, errors.Wrap(err, "unable to init key source")
+		return Authenticator{}, errors.Wrap(err, "unable to init key source")
 	}
 	u, err := url.Parse(cfg.AuthConfig.RedirectURL)
 	if err != nil {
-		return Client{}, errors.Wrap(err, "unable to pasrse redirect URL")
+		return Authenticator{}, errors.Wrap(err, "unable to pasrse redirect URL")
 	}
 	keys, err := kms.NewKeyManagementClient(ctx)
 	if err != nil {
-		return Client{}, errors.Wrap(err, "unable to init KMS client")
+		return Authenticator{}, errors.Wrap(err, "unable to init KMS client")
 	}
-
-	return Client{
+	return Authenticator{
 		cfg:          cfg,
 		keys:         keys,
 		cookieDomain: strings.Split(u.Host, ":")[0],
@@ -91,13 +96,12 @@ func NewClient(ctx context.Context, cfg Config, lg log.Logger) (Client, error) {
 		callbackPath: u.Path,
 		verifier: auth.NewVerifier(ks, gcp.IdentityClaimsDecoderFunc,
 			gcp.IdentityVerifyFunc(cfg.IDVerifyFunc)),
-		log: lg,
 	}, nil
 }
 
 // ClearCookie can be used within a "log out" flow. It will add an HTTP cookie with a -1
 // "MaxAge" to the response to remove the cookie from the logged in user's browser.
-func (c Client) ClearCookie(w http.ResponseWriter) {
+func (c Authenticator) ClearCookie(w http.ResponseWriter) {
 	http.SetCookie(w, &http.Cookie{
 		Name:    c.cfg.CookieName,
 		Domain:  c.cookieDomain,
@@ -110,7 +114,7 @@ func (c Client) ClearCookie(w http.ResponseWriter) {
 // Middleware will handle login redirects, OAuth callbacks, header exceptions, verifying
 // inbound Google ID JWS' within HTTP cookies and, if the user passes all checks, it will
 // add the user claims to the inbound request context.
-func (c Client) Middleware(h http.Handler) http.Handler {
+func (c Authenticator) Middleware(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == c.callbackPath {
 			c.callbackHandler(w, r)
@@ -156,7 +160,7 @@ func (c Client) Middleware(h http.Handler) http.Handler {
 	})
 }
 
-func (c Client) callbackHandler(w http.ResponseWriter, r *http.Request) {
+func (c Authenticator) callbackHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	q := r.URL.Query()
 
@@ -175,20 +179,27 @@ func (c Client) callbackHandler(w http.ResponseWriter, r *http.Request) {
 
 	token, err := c.cfg.AuthConfig.Exchange(ctx, code)
 	if err != nil {
-		c.log.Log("error", err, "message", "unable to exchange code")
+		c.cfg.Logger.Log("error", err, "message", "unable to exchange code")
 		c.redirect(w, r)
 		return
 	}
-	id := token.Extra("id_token")
-	if id == nil {
+	idI := token.Extra("id_token")
+	if idI == nil {
+		c.redirect(w, r)
+		return
+	}
+	id, ok := idI.(string)
+	if !ok {
+		c.cfg.Logger.Log("message", "id_token was not a string",
+			"error", "unexpectected type: "+fmt.Sprintf("%T", idI))
 		c.redirect(w, r)
 		return
 	}
 
 	// grab claims so we can use the expiration on our cookie
-	claims, err := decodeClaims(id.(string))
+	claims, err := decodeClaims(id)
 	if err != nil {
-		c.log.Log("error", err, "message", "unable to decode token")
+		c.cfg.Logger.Log("error", err, "message", "unable to decode token")
 		c.redirect(w, r)
 		return
 	}
@@ -196,14 +207,14 @@ func (c Client) callbackHandler(w http.ResponseWriter, r *http.Request) {
 	http.SetCookie(w, &http.Cookie{
 		Name:    c.cfg.CookieName,
 		Secure:  c.secureCookie,
-		Value:   id.(string),
+		Value:   id,
 		Domain:  c.cookieDomain,
 		Expires: time.Unix(claims.Exp, 0),
 	})
 	http.Redirect(w, r, uri, http.StatusTemporaryRedirect)
 }
 
-func (c Client) verifyState(ctx context.Context, state string) (string, bool) {
+func (c Authenticator) verifyState(ctx context.Context, state string) (string, bool) {
 	if state == "" {
 		return "", false
 	}
@@ -217,7 +228,7 @@ func (c Client) verifyState(ctx context.Context, state string) (string, bool) {
 		Ciphertext: rawState,
 	})
 	if err != nil {
-		c.log.Log("error", err, "message", "unable to decrypt state",
+		c.cfg.Logger.Log("error", err, "message", "unable to decrypt state",
 			"state", state)
 		return "", false
 	}
@@ -225,7 +236,7 @@ func (c Client) verifyState(ctx context.Context, state string) (string, bool) {
 	return string(decRes.Plaintext), true
 }
 
-func (c Client) redirect(w http.ResponseWriter, r *http.Request) {
+func (c Authenticator) redirect(w http.ResponseWriter, r *http.Request) {
 	state := "/" // can't be empty
 	uri := r.URL.EscapedPath()
 	if r.URL.RawQuery != "" {
@@ -241,7 +252,7 @@ func (c Client) redirect(w http.ResponseWriter, r *http.Request) {
 		Plaintext: []byte(uri),
 	})
 	if err != nil {
-		c.log.Log("error", err, "message", "unable to encrypt state")
+		c.cfg.Logger.Log("error", err, "message", "unable to encrypt state")
 	} else {
 		state = base64.StdEncoding.EncodeToString(encRes.Ciphertext)
 	}
@@ -254,8 +265,8 @@ type key int
 
 const claimsKey key = 1
 
-// GetUserClaims will return the Google ID claim set if it exists in the
-// context. This can be used in coordination with the Client.Middleware.
+// GetUserClaims will return the Google identity claim set if it exists in the
+// context. This can be used in coordination with the Authenticator.Middleware.
 func GetUserClaims(ctx context.Context) (gcp.IdentityClaimSet, error) {
 	var claims gcp.IdentityClaimSet
 	clms := ctx.Value(claimsKey)
