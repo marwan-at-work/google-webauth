@@ -304,7 +304,6 @@ func (c Authenticator) redirect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if c.keys != nil {
-		// encrypt current URL as state
 		encRes, err := c.keys.Encrypt(r.Context(), &kmsv1.EncryptRequest{
 			Name:      c.cfg.KMSKeyName,
 			Plaintext: stateData,
