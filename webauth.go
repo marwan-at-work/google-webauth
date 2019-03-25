@@ -96,6 +96,9 @@ func New(ctx context.Context, cfg Config) (Authenticator, error) {
 			return Authenticator{}, errors.Wrap(err, "unable to init KMS client")
 		}
 	}
+	if cfg.Logger == nil {
+		cfg.Logger = log.NewNopLogger()
+	}
 	return Authenticator{
 		cfg:          cfg,
 		keys:         keys,
