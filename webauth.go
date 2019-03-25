@@ -4,9 +4,11 @@ package webauth
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -49,6 +51,9 @@ type (
 		// KMSKeyName is used by a Google KMS client for encrypting and decrypting state
 		// tokens within the oauth exchange.
 		KMSKeyName string
+		// UnsafeState can be used to skip the encryption of the "state" token
+		// within the auth flow.
+		UnsafeState bool
 
 		// AuthConfig is used by Authenticator.Middleware and callback to enable the
 		// Google OAuth flow.
@@ -84,9 +89,12 @@ func New(ctx context.Context, cfg Config) (Authenticator, error) {
 	if err != nil {
 		return Authenticator{}, errors.Wrap(err, "unable to pasrse redirect URL")
 	}
-	keys, err := kms.NewKeyManagementClient(ctx)
-	if err != nil {
-		return Authenticator{}, errors.Wrap(err, "unable to init KMS client")
+	var keys *kms.KeyManagementClient
+	if !cfg.UnsafeState {
+		keys, err = kms.NewKeyManagementClient(ctx)
+		if err != nil {
+			return Authenticator{}, errors.Wrap(err, "unable to init KMS client")
+		}
 	}
 	return Authenticator{
 		cfg:          cfg,
@@ -223,6 +231,15 @@ func (c Authenticator) verifyState(ctx context.Context, state string) (string, b
 		return "", false
 	}
 
+	var data stateData
+	if c.keys == nil {
+		err = json.Unmarshal(rawState, &data)
+		if err != nil {
+			return "", false
+		}
+		return data.verifiedURI()
+	}
+
 	decRes, err := c.keys.Decrypt(ctx, &kmsv1.DecryptRequest{
 		Name:       c.cfg.KMSKeyName,
 		Ciphertext: rawState,
@@ -233,7 +250,30 @@ func (c Authenticator) verifyState(ctx context.Context, state string) (string, b
 		return "", false
 	}
 
-	return string(decRes.Plaintext), true
+	err = json.Unmarshal(decRes.Plaintext, &data)
+	if err != nil {
+		return "", false
+	}
+	return data.verifiedURI()
+}
+
+func (s stateData) verifiedURI() (string, bool) {
+	return s.URI, time.Now().Before(s.Expiry)
+}
+
+type stateData struct {
+	Expiry time.Time
+	URI    string
+	Nonce  *[24]byte
+}
+
+func newNonce() (*[24]byte, error) {
+	nonce := &[24]byte{}
+	_, err := io.ReadFull(rand.Reader, nonce[:])
+	if err != nil {
+		return nonce, errors.Wrap(err, "unable to generate nonce from rand.Reader")
+	}
+	return nonce, nil
 }
 
 func (c Authenticator) redirect(w http.ResponseWriter, r *http.Request) {
@@ -246,16 +286,36 @@ func (c Authenticator) redirect(w http.ResponseWriter, r *http.Request) {
 	if strings.HasPrefix(uri, c.cfg.AuthConfig.RedirectURL) {
 		uri = "/"
 	}
-	// encrypt current URL as state
-	encRes, err := c.keys.Encrypt(r.Context(), &kmsv1.EncryptRequest{
-		Name:      c.cfg.KMSKeyName,
-		Plaintext: []byte(uri),
+	nonce, err := newNonce()
+	if err != nil {
+		c.cfg.Logger.Log("error", err, "message", "unable to generate nonce")
+		http.Error(w, "oauth error", http.StatusInternalServerError)
+		return
+	}
+	const stateExpiryMins = 10
+	stateData, err := json.Marshal(stateData{
+		Expiry: time.Now().Add(stateExpiryMins * time.Minute),
+		URI:    uri,
+		Nonce:  nonce,
 	})
 	if err != nil {
-		c.cfg.Logger.Log("error", err, "message", "unable to encrypt state")
-	} else {
-		state = base64.StdEncoding.EncodeToString(encRes.Ciphertext)
+		c.cfg.Logger.Log("error", err, "message", "unable to encode state")
+		http.Error(w, "oauth error", http.StatusInternalServerError)
+		return
 	}
+	if c.keys != nil {
+		// encrypt current URL as state
+		encRes, err := c.keys.Encrypt(r.Context(), &kmsv1.EncryptRequest{
+			Name:      c.cfg.KMSKeyName,
+			Plaintext: stateData,
+		})
+		if err != nil {
+			c.cfg.Logger.Log("error", err, "message", "unable to encrypt state")
+		} else {
+			stateData = encRes.Ciphertext
+		}
+	}
+	state = base64.StdEncoding.EncodeToString(stateData)
 
 	http.Redirect(w, r, c.cfg.AuthConfig.AuthCodeURL(state),
 		http.StatusTemporaryRedirect)
